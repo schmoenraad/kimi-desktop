@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="node_modules/xterm/css/xterm.css">
+<style>
+  html, body { height: 100%; margin: 0; background: #1e1e1e; }
+  #term { height: 100%; padding: 4px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="node_modules/xterm/lib/xterm.js"></script>
+<script src="node_modules/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+<script>
+  const { ipcRenderer } = require('electron');
+  const term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'Menlo, monospace' });
+  const fitAddon = new FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(document.getElementById('term'));
+  fitAddon.fit();
+  // Accumulated output buffer — used by the KIMI_TEST_TERM self-test hook.
+  window.__termBuf = '';
+
+  term.onData((d) => ipcRenderer.send('term-input', d));
+  term.onResize(({ cols, rows }) => ipcRenderer.send('term-resize', { cols, rows }));
+  ipcRenderer.on('term-data', (_e, d) => { window.__termBuf += d; term.write(d); });
+  ipcRenderer.on('term-exit', (_e, code) =>
+    term.write(`\r\n\x1b[90m[process exited${code != null ? ' with code ' + code : ''}]\x1b[0m\r\n`));
+  ipcRenderer.on('term-error', (_e, msg) => term.write(`\r\n\x1b[31m[${msg}]\x1b[0m\r\n`));
+
+  ipcRenderer.send('term-ready', { cols: term.cols, rows: term.rows });
+</script>
+</body>
+</html>

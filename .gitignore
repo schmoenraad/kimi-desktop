@@ -1,0 +1,14 @@
+node_modules/
+dist/
+out/
+
+# Local notes, not for publishing
+HANDOVER.md
+
+.DS_Store
+*.log
+npm-debug.log*
+
+# Generated icon intermediates (icon.icns is committed)
+build/icon.iconset/
+build/icon-1024.png

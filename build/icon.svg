@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4da3ff"/>
+      <stop offset="1" stop-color="#1f7ae0"/>
+    </linearGradient>
+  </defs>
+  <!-- macOS-style rounded squircle with margin -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <!-- Kimi mark: two rounded vertical bars -->
+  <rect x="380" y="360" width="100" height="304" rx="50" fill="#ffffff"/>
+  <rect x="544" y="360" width="100" height="304" rx="50" fill="#ffffff"/>
+</svg>
