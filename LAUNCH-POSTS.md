@@ -1,26 +1,47 @@
 # Launch posts
 
-Ready to paste. Replace `github.com/schmoenraad/kimi-desktop` if you name the repo
-something else. Attach `screenshots/app-hero.png` to the first post of either version.
+Ready to paste. Attach `screenshots/app-hero.png` to the first tweet.
 
 ---
 
-## Option A — single post (simplest)
+## Primary — 2 tweets (use this)
 
-> Kimi Code ships a great local web UI — as a browser tab.
->
-> So I wrapped it in a real Mac app: ⌥Space from anywhere, Dock icon, native
-> notifications when the agent needs approval.
->
-> Burned ~half my weekly Kimi quota building it 🙂
->
-> MIT, unofficial: github.com/schmoenraad/kimi-desktop
+**Tweet 1** — 273 chars, attach `screenshots/app-hero.png`
 
-*(269 chars, fits the 280 limit — attach `screenshots/app-hero.png`)*
+> Kimi Code doesn't have a desktop app yet — so I built one.
+>
+> Like Claude Desktop, but for Kimi. ⌥Space from anywhere, real Dock icon, native
+> notifications when the agent needs approval. No more lost browser tab.
+>
+> First thing I've properly shipped 🙂
+>
+> https://github.com/schmoenraad/kimi-desktop
+
+**Tweet 2** (reply to Tweet 1) — 188 chars
+
+> Burnt through a lot of tokens getting this right — not all of them, I'm building a
+> game on the side too 😅
+>
+> It just makes Kimi Code easier to live with day to day.
+>
+> MIT, unofficial. Enjoy!
+
+## Alternative — single tweet
+
+276 chars, attach `screenshots/app-hero.png`
+
+> Kimi Code doesn't have a desktop app yet — so I built one.
+>
+> Like Claude Desktop but for Kimi: ⌥Space from anywhere, Dock icon, notifications
+> when the agent needs you.
+>
+> First thing I've properly shipped. Burnt a lot of tokens getting it right 😅 Enjoy!
+>
+> https://github.com/schmoenraad/kimi-desktop
 
 ---
 
-## Option B — thread (more reach)
+## Longer thread (optional, more technical detail)
 
 **1/**
 > Kimi Code ships a genuinely good local web UI.
@@ -80,14 +101,10 @@ something else. Attach `screenshots/app-hero.png` to the first post of either ve
 > published frame. Don't trust yourself, assert.
 
 **7/**
-> Built with Kimi, on Kimi.
->
-> Shipping this nearly maxed my 5-hour budget (94%) more than once and ate ~half my
-> 7-day quota.
+> Burnt through a lot of tokens getting this right — not all of them, I'm building a
+> game on the side too 😅
 >
 > Half my credits went into it so yours don't have to 🙂
-
-*(optional: attach your quota screenshot here — see the note below before you do)*
 
 **8/**
 > The best part is how little code it is. Every feature is a thin call to an API that
@@ -96,22 +113,14 @@ something else. Attach `screenshots/app-hero.png` to the first post of either ve
 > If a tool you like ships a localhost server, go read what's on it. It's usually more
 > than the UI shows.
 >
-> MIT, unofficial: github.com/schmoenraad/kimi-desktop
+> MIT, unofficial: https://github.com/schmoenraad/kimi-desktop
 
 ---
 
 ## Notes before posting
 
-- **The quota numbers are real** — 93.87% of the 5-hour budget, 47.43% of the 7-day, on
-  an Allegretto plan (26.02% of the month). If you round them in a reword, keep them
-  honest; "half my credits" is the 7-day figure, not the monthly one.
-- **If you attach the quota screenshot**, it shows your plan tier and renewal date
-  (2027-01-29). No name, email or account ID is visible, so it's safe enough — but it is
-  billing-adjacent, so it's your call rather than a default.
 - The repo is **unofficial and not affiliated with Moonshot AI** — that's stated in the
   README and the posts avoid implying otherwise. Worth keeping if you reword.
 - The app is **unsigned**; expect "unidentified developer" questions. Answer: right-click
   → Open, or build it yourself from source.
 - It's **Apple Silicon only** right now — the most likely first question.
-- The 429 numbers are from one morning's testing, not a benchmark. If someone pushes
-  back, that's the honest framing.
