@@ -4,6 +4,7 @@ const {
 } = require('electron');
 const { spawn, execFileSync, execFile } = require('child_process');
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -11,10 +12,18 @@ const TOML = require('@ltd/j-toml');
 const WebSocket = require('ws');
 
 const KIMI_PORT = 58627;
-const KIMI_URL = `http://127.0.0.1:${KIMI_PORT}/`;
+// The port the running server actually bound. Since kimi-code 0.28 a busy
+// port is retried with +1, so this can drift from KIMI_PORT; every request
+// goes through kimiPort / kimiBaseUrl().
+let kimiPort = KIMI_PORT;
+const kimiBaseUrl = () => `http://127.0.0.1:${kimiPort}/`;
 const SERVER_TOKEN_FILE = path.join(os.homedir(), '.kimi-code', 'server.token');
 const CONFIG_FILE = path.join(os.homedir(), '.kimi-code', 'config.toml');
 const SKILLS_DIR = path.join(os.homedir(), '.kimi-code', 'skills');
+// kimi-code 0.28+: each `kimi web` instance registers itself here (JSON with
+// pid/port). Used to find the process to stop and the port it drifted to.
+const SERVER_INSTANCES_DIR = path.join(os.homedir(), '.kimi-code', 'server', 'instances');
+const SERVER_PID_FILE = () => path.join(app.getPath('userData'), 'server-pid.json');
 const PREFS_FILE = () => path.join(app.getPath('userData'), 'prefs.json');
 const WINDOW_STATE_FILE = () => path.join(app.getPath('userData'), 'window-state.json');
 const QUICK_TOGGLE_ACCELERATOR = 'Alt+Space';
@@ -24,6 +33,17 @@ let tray = null;
 let serverHealthy = true;
 let serverBusyUntil = 0;
 let serverStatusMessage = 'Server OK';
+
+// Watchdog: how often we ping /healthz, how many consecutive misses before we
+// treat the daemon as actually down (vs. one slow/blipped check), and how
+// long to wait between automatic recovery attempts so a genuinely stuck
+// daemon doesn't get hammered with restart attempts.
+const HEALTH_CHECK_INTERVAL_MS = 20000;
+const HEALTH_FAILURE_THRESHOLD = 2;
+const RECOVERY_COOLDOWN_MS = 90000;
+let consecutiveHealthFailures = 0;
+let lastRecoveryAttempt = 0;
+let recoveryFailureNotified = false;
 
 // ---------------------------------------------------------------------------
 // Preferences (recent projects, hotkey toggle)
@@ -322,9 +342,34 @@ function findInShellPath(cmd) {
   }
 }
 
+let kimiVersionCache = null;
+
+function getKimiVersion(kimiBin) {
+  if (kimiVersionCache) return kimiVersionCache;
+  const bin = kimiBin || findKimiBinary();
+  if (!bin) return '';
+  try {
+    kimiVersionCache = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 15000 }).trim();
+  } catch {
+    kimiVersionCache = '';
+  }
+  return kimiVersionCache;
+}
+
+/** Pre-0.28 CLI: `kimi server kill` manages a background daemon. 0.28+
+ *  replaced it with foreground `kimi web`, and `kimi server …` just exits 1. */
+function isLegacyCli(kimiBin) {
+  const parts = getKimiVersion(kimiBin).split('.').map((n) => parseInt(n, 10) || 0);
+  return parts.length >= 2 && parts[0] === 0 && parts[1] < 28;
+}
+
+// Pid of the server this app process spawned (also persisted so a later app
+// run can still stop the server it started earlier).
+let spawnedServerPid = null;
+
 function isServerUp() {
   return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port: KIMI_PORT, path: '/', timeout: 1500 }, (res) => {
+    const req = http.get({ host: '127.0.0.1', port: kimiPort, path: '/', timeout: 1500 }, (res) => {
       res.resume();
       resolve(res.statusCode >= 200 && res.statusCode < 500);
     });
@@ -335,13 +380,21 @@ function isServerUp() {
 
 function startKimiServer(kimiBin) {
   return new Promise((resolve, reject) => {
-    const child = spawn(kimiBin, ['web', '--no-open', '--port', String(KIMI_PORT)], {
+    const child = spawn(kimiBin, ['web', '--no-open', '--port', String(kimiPort)], {
       detached: true,
       stdio: 'ignore',
       env: { ...process.env, PATH: `${path.dirname(kimiBin)}:${process.env.PATH || '/usr/bin:/bin'}` },
     });
     child.on('error', reject);
     child.unref();
+    if (child.pid) {
+      spawnedServerPid = child.pid;
+      try {
+        fs.writeFileSync(SERVER_PID_FILE(), JSON.stringify({ pid: child.pid, startedAt: Date.now() }));
+      } catch {
+        // best-effort only
+      }
+    }
     resolve();
   });
 }
@@ -355,31 +408,131 @@ async function waitForServer(timeoutMs = 20000) {
   return false;
 }
 
-async function ensureKimiServer() {
+/**
+ * 0.28+ retries a busy port with +1 instead of failing, so a server we just
+ * spawned may not be on kimiPort. Look up our child in the instance registry
+ * and adopt the port it actually bound. Returns true when a port was adopted.
+ */
+function adoptSpawnedInstancePort() {
+  if (!spawnedServerPid) return false;
+  try {
+    for (const f of fs.readdirSync(SERVER_INSTANCES_DIR)) {
+      let info;
+      try {
+        info = JSON.parse(fs.readFileSync(path.join(SERVER_INSTANCES_DIR, f), 'utf8'));
+      } catch {
+        continue;
+      }
+      if (info && info.pid === spawnedServerPid && info.port && info.port !== kimiPort) {
+        kimiPort = info.port;
+        return true;
+      }
+    }
+  } catch {
+    // registry missing or unreadable
+  }
+  return false;
+}
+
+/** silent: true suppresses modal dialogs — for the background watchdog, where a
+ *  popup would be unprompted and unexpected rather than a response to a click. */
+async function ensureKimiServer({ silent = false } = {}) {
   if (await isServerUp()) return true;
   const kimiBin = findKimiBinary();
   if (!kimiBin) {
-    dialog.showErrorBox(
-      'Kimi Code not found',
-      'Could not find the "kimi" command. Install Kimi Code first:\n\nnpm install -g @moonshot-ai/kimi-code'
-    );
+    if (!silent) {
+      dialog.showErrorBox(
+        'Kimi Code not found',
+        'Could not find the "kimi" command. Install Kimi Code first:\n\nnpm install -g @moonshot-ai/kimi-code'
+      );
+    }
     return false;
   }
   await startKimiServer(kimiBin);
-  const up = await waitForServer();
-  if (!up) {
+  let up = await waitForServer();
+  if (!up && adoptSpawnedInstancePort()) {
+    // The server came up on a drifted port (preferred port was busy).
+    up = await waitForServer(5000);
+  }
+  if (!up && !silent) {
     dialog.showErrorBox(
       'Kimi server did not start',
-      `The Kimi server did not respond on port ${KIMI_PORT}.\nTry running "kimi doctor" in a terminal, then relaunch.`
+      `The Kimi server did not respond on port ${kimiPort}.\nTry running "kimi doctor" in a terminal, then relaunch.`
     );
   }
   return up;
 }
 
+/**
+ * Best-effort pid for the server on kimiPort: the child we spawned, the pid
+ * file from an earlier app run, the instance registry, then whoever listens
+ * on the port. Used to stop foreground (0.28+) servers.
+ */
+function findServerPid() {
+  if (spawnedServerPid) return spawnedServerPid;
+  try {
+    const saved = JSON.parse(fs.readFileSync(SERVER_PID_FILE(), 'utf8'));
+    if (saved && saved.pid) return saved.pid;
+  } catch {
+    // no pid file
+  }
+  try {
+    for (const f of fs.readdirSync(SERVER_INSTANCES_DIR)) {
+      let info;
+      try {
+        info = JSON.parse(fs.readFileSync(path.join(SERVER_INSTANCES_DIR, f), 'utf8'));
+      } catch {
+        continue;
+      }
+      if (info && info.port === kimiPort && info.pid) return info.pid;
+    }
+  } catch {
+    // registry missing or unreadable
+  }
+  try {
+    const out = execFileSync('lsof', ['-ti', `:${kimiPort}`], { encoding: 'utf8', timeout: 5000 }).trim();
+    const pid = parseInt(out.split('\n')[0], 10);
+    if (pid) return pid;
+  } catch {
+    // nothing listening
+  }
+  return null;
+}
+
+/**
+ * Stop the running Kimi server. Pre-0.28 CLIs ran a background daemon managed
+ * by `kimi server kill`; 0.28+ servers are foreground processes stopped via
+ * their shutdown endpoint or a signal.
+ */
+async function stopKimiServerProcess(kimiBin) {
+  if (isLegacyCli(kimiBin)) {
+    try { execFileSync(kimiBin, ['server', 'kill'], { timeout: 15000 }); } catch { /* may not be running */ }
+    return;
+  }
+  try { await apiRequest('POST', '/api/v1/shutdown'); } catch { /* may already be down */ }
+  const deadline = Date.now() + 5000;
+  while (await isServerUp()) {
+    if (Date.now() > deadline) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (!(await isServerUp())) return;
+  const pid = findServerPid();
+  if (!pid) return;
+  try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+  const termDeadline = Date.now() + 5000;
+  while (await isServerUp()) {
+    if (Date.now() > termDeadline) {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
 async function restartKimiServer() {
   const kimiBin = findKimiBinary();
   if (!kimiBin) return;
-  try { execFileSync(kimiBin, ['server', 'kill'], { timeout: 15000 }); } catch { /* may not be running */ }
+  await stopKimiServerProcess(kimiBin);
   await ensureKimiServer();
   if (mainWindow) mainWindow.loadURL(kimiUrlWithToken());
   buildMenu();
@@ -401,7 +554,8 @@ function readServerToken() {
 
 function kimiUrlWithToken() {
   const token = readServerToken();
-  return token ? `${KIMI_URL}#token=${encodeURIComponent(token)}` : KIMI_URL;
+  const base = kimiBaseUrl();
+  return token ? `${base}#token=${encodeURIComponent(token)}` : base;
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +644,7 @@ function setSpaPref(key, value) {
   wc.executeJavaScript(`try { localStorage.setItem(${jsString(key)}, ${jsString(value)}); } catch {}`)
     .catch(() => {})
     .finally(() => {
-      if (wc.getURL().startsWith(KIMI_URL)) wc.loadURL(kimiUrlWithToken());
+      if (wc.getURL().startsWith(kimiBaseUrl())) wc.loadURL(kimiUrlWithToken());
     });
 }
 
@@ -510,12 +664,12 @@ function switchToSession(workspaceName, sessionTitle) {
     // message to render twice (snapshot + live stream).
     driveSidebarToSession(workspaceName, sessionTitle);
     setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed() && wc.getURL().startsWith(KIMI_URL)) {
+      if (mainWindow && !mainWindow.isDestroyed() && wc.getURL().startsWith(kimiBaseUrl())) {
         wc.loadURL(kimiUrlWithToken());
       }
     }, 3500);
   };
-  if (wc.getURL().startsWith(KIMI_URL)) {
+  if (wc.getURL().startsWith(kimiBaseUrl())) {
     run();
   } else {
     wc.once('did-finish-load', run);
@@ -573,7 +727,7 @@ function healthCheck() {
     const req = http.get(
       {
         host: '127.0.0.1',
-        port: KIMI_PORT,
+        port: kimiPort,
         path: '/api/v1/healthz',
         headers: token ? { Authorization: `Bearer ${token}` } : {},
         timeout: 6000,
@@ -590,15 +744,60 @@ function healthCheck() {
 
 async function updateServerHealth() {
   const ok = await healthCheck();
-  serverHealthy = ok;
-  serverStatusMessage = ok ? 'Server OK' : 'Server not responding';
   if (ok) {
+    const wasDown = consecutiveHealthFailures >= HEALTH_FAILURE_THRESHOLD;
+    consecutiveHealthFailures = 0;
+    recoveryFailureNotified = false;
+    serverHealthy = true;
+    serverStatusMessage = 'Server OK';
     // Refresh the state the menus mirror (account, MCP servers).
     await refreshAuthState();
     await refreshMcpServers();
+    if (wasDown) {
+      notifyOK('Kimi Code', 'Reconnected — the Kimi server is responding again.');
+    }
+  } else {
+    consecutiveHealthFailures += 1;
+    serverHealthy = false;
+    serverStatusMessage = 'Server not responding';
+    if (consecutiveHealthFailures >= HEALTH_FAILURE_THRESHOLD) {
+      await attemptServerRecovery();
+    }
   }
   buildTray();
   buildMenu();
+}
+
+/**
+ * The daemon can die while the app is already open and showing a connected
+ * window — the app only auto-starts it once, at launch. This runs off the
+ * health-check watchdog: once /healthz has missed HEALTH_FAILURE_THRESHOLD
+ * checks in a row, try to bring the daemon back and reload the window so the
+ * user never has to notice or intervene manually.
+ */
+async function attemptServerRecovery() {
+  const now = Date.now();
+  if (now - lastRecoveryAttempt < RECOVERY_COOLDOWN_MS) return;
+  lastRecoveryAttempt = now;
+
+  const up = await ensureKimiServer({ silent: true });
+  if (up) {
+    consecutiveHealthFailures = 0;
+    recoveryFailureNotified = false;
+    serverHealthy = true;
+    serverStatusMessage = 'Server OK (recovered)';
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.loadURL(kimiUrlWithToken());
+    }
+    notifyOK('Kimi Code', 'The Kimi server had stopped responding — restarted it and reconnected automatically.');
+  } else if (!recoveryFailureNotified) {
+    recoveryFailureNotified = true;
+    notifyOK(
+      'Kimi Code — server unreachable',
+      'The Kimi server stopped responding and could not be restarted automatically. ' +
+        'Try Kimi Code → Restart Kimi Server, or run "kimi doctor" in a terminal.'
+    );
+  }
 }
 
 function notifyOverload(reason) {
@@ -682,7 +881,7 @@ function apiRequest(method, apiPath, body) {
     const req = http.request(
       {
         host: '127.0.0.1',
-        port: KIMI_PORT,
+        port: kimiPort,
         path: apiPath,
         method,
         headers: {
@@ -727,11 +926,15 @@ async function stopKimiServer() {
     buttons: ['Stop Server', 'Cancel'],
     defaultId: 1,
     message: 'Stop the Kimi server?',
-    detail: 'This will run "kimi server kill". You can restart it from the Kimi Code menu.',
+    detail: 'The server is shared with the kimi CLI. You can restart it from the Kimi Code menu.',
   });
   if (response !== 0) return;
   try {
-    execFileSync(kimiBin, ['server', 'kill'], { timeout: 15000 });
+    await stopKimiServerProcess(kimiBin);
+    if (await isServerUp()) {
+      dialog.showErrorBox('Could not stop server', 'The Kimi server is still responding. Try restarting the app or run "kimi doctor" in a terminal.');
+      return;
+    }
     dialog.showMessageBox({ type: 'info', message: 'Kimi server stopped', buttons: ['OK'] });
   } catch (err) {
     dialog.showErrorBox('Could not stop server', String(err.message || err).slice(0, 800));
@@ -1781,7 +1984,7 @@ async function startTerminal(cols, rows) {
     });
     terminalId = data.id || data.terminal_id;
     const token = readServerToken();
-    terminalWs = new WebSocket(`ws://127.0.0.1:${KIMI_PORT}/api/v1/ws`, {
+    terminalWs = new WebSocket(`ws://127.0.0.1:${kimiPort}/api/v1/ws`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     terminalWs.on('open', () => {
@@ -2438,6 +2641,9 @@ async function upgradeKimi() {
       dialog.showErrorBox('Upgrade failed', String(stderr || err.message).slice(0, 800));
       return;
     }
+    kimiVersionCache = null; // the binary on disk just changed
+    updateState.cliLatest = null;
+    updateState.cliInstalled = null;
     await restartKimiServer();
     const kimiBin = findKimiBinary();
     let version = '';
@@ -2448,6 +2654,147 @@ async function upgradeKimi() {
       detail: version ? `Now running version ${version}. Server restarted.` : 'Server restarted.',
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Update checking
+//
+// The app is unsigned, so a silent electron-updater install is not possible
+// on macOS (it refuses unsigned bundles). Instead: poll GitHub releases for
+// the app and the npm registry for the CLI, then offer the download page or
+// the existing upgrade flow.
+// ---------------------------------------------------------------------------
+
+const APP_RELEASES_API = 'https://api.github.com/repos/schmoenraad/kimi-desktop/releases/latest';
+const CLI_REGISTRY_API = 'https://registry.npmjs.org/@moonshot-ai%2Fkimi-code/latest';
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+const updateState = { appLatest: null, appUrl: null, cliLatest: null, cliInstalled: null };
+
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'kimi-code-desktop' }, timeout: 6000 }, (res) => {
+      if (res.statusCode === 404) {
+        res.resume();
+        resolve(null); // repo has no published releases yet
+        return;
+      }
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch {
+          reject(new Error(`Unexpected response (HTTP ${res.statusCode})`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
+  });
+}
+
+/** Numeric semver-ish compare: is `latest` newer than `current`? */
+function isNewerVersion(latest, current) {
+  const parse = (v) => String(v).replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
+  const a = parse(latest);
+  const b = parse(current);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return false;
+}
+
+/** One-line summary for the app menu, or null when nothing is newer. */
+function updateAvailableSummary() {
+  const parts = [];
+  if (updateState.appLatest && isNewerVersion(updateState.appLatest, app.getVersion())) {
+    parts.push(`app ${updateState.appLatest.replace(/^v/, '')}`);
+  }
+  if (updateState.cliLatest && updateState.cliInstalled && isNewerVersion(updateState.cliLatest, updateState.cliInstalled)) {
+    parts.push(`CLI ${updateState.cliLatest}`);
+  }
+  return parts.length ? `Update available: ${parts.join(' + ')}` : null;
+}
+
+async function checkForUpdates({ silent = false } = {}) {
+  let appUpdate = null;
+  let cliUpdate = null;
+  let appReleasesExist = true;
+  try {
+    const rel = await httpsGetJson(APP_RELEASES_API);
+    if (!rel || !rel.tag_name) {
+      appReleasesExist = false;
+    } else {
+      updateState.appLatest = rel.tag_name;
+      updateState.appUrl = rel.html_url;
+      if (isNewerVersion(rel.tag_name, app.getVersion())) appUpdate = { version: rel.tag_name, url: rel.html_url };
+    }
+  } catch {
+    appReleasesExist = false;
+  }
+  try {
+    const data = await httpsGetJson(CLI_REGISTRY_API);
+    const installed = getKimiVersion();
+    if (data && data.version) {
+      updateState.cliLatest = data.version;
+      updateState.cliInstalled = installed || null;
+      if (installed && isNewerVersion(data.version, installed)) {
+        cliUpdate = { version: data.version, installed };
+      }
+    }
+  } catch {
+    // offline or registry hiccup — leave previous state
+  }
+  prefs.lastUpdateCheck = Date.now();
+  savePrefs(prefs);
+  buildMenu();
+
+  if (!appUpdate && !cliUpdate) {
+    if (!silent) {
+      dialog.showMessageBox({
+        type: 'info',
+        message: "You're up to date",
+        detail:
+          `App: ${app.getVersion()}${updateState.appLatest ? ` (latest ${updateState.appLatest.replace(/^v/, '')})` : appReleasesExist ? '' : ' (no published releases yet)'}\n` +
+          `Kimi CLI: ${getKimiVersion() || 'not found'}${updateState.cliLatest ? ` (latest ${updateState.cliLatest})` : ''}`,
+        buttons: ['OK'],
+      });
+    }
+    return;
+  }
+
+  const lines = [];
+  if (appUpdate) lines.push(`Kimi Code Desktop ${appUpdate.version.replace(/^v/, '')} (you have ${app.getVersion()})`);
+  if (cliUpdate) lines.push(`Kimi Code CLI ${cliUpdate.version} (you have ${cliUpdate.installed})`);
+  if (silent) {
+    notifyOK('Kimi Code — update available', lines.join('\n'));
+    return;
+  }
+  const buttons = [];
+  if (appUpdate) buttons.push('Download App Update');
+  if (cliUpdate) buttons.push('Upgrade CLI');
+  buttons.push('Later');
+  const { response } = await dialog.showMessageBox({
+    type: 'info',
+    message: 'Updates available',
+    detail: lines.join('\n'),
+    buttons,
+    defaultId: 0,
+    cancelId: buttons.length - 1,
+  });
+  if (appUpdate && response === 0) {
+    shell.openExternal(appUpdate.url);
+  } else if (cliUpdate && response === (appUpdate ? 1 : 0)) {
+    upgradeKimi();
+  }
+}
+
+/** Silent background check, at most once every UPDATE_CHECK_INTERVAL_MS. */
+function maybeAutoCheckUpdates() {
+  if (Date.now() - (prefs.lastUpdateCheck || 0) < UPDATE_CHECK_INTERVAL_MS) return;
+  checkForUpdates({ silent: true }).catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -2545,7 +2892,7 @@ function createWindow() {
   });
 
   // Open external links in the default browser; keep the local UI in-app.
-  const isLocal = (url) => url.startsWith(`http://127.0.0.1:${KIMI_PORT}`) || url.startsWith(`http://localhost:${KIMI_PORT}`);
+  const isLocal = (url) => url.startsWith(`http://127.0.0.1:${kimiPort}`) || url.startsWith(`http://localhost:${kimiPort}`);
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (!isLocal(url)) {
       shell.openExternal(url);
@@ -2639,6 +2986,8 @@ function buildMenu() {
         { label: 'Restart Kimi Server', click: restartKimiServer },
         { label: 'Stop Kimi Server', click: stopKimiServer },
         { label: 'Upgrade Kimi Code…', click: upgradeKimi },
+        { label: 'Check for Updates…', click: () => checkForUpdates({ silent: false }) },
+        ...(updateAvailableSummary() ? [{ label: updateAvailableSummary(), enabled: false }] : []),
         { type: 'separator' },
         { label: 'Plan Usage…', click: showUsageDialog },
         { type: 'separator' },
@@ -3117,9 +3466,14 @@ app.whenReady().then(async () => {
   }
   createWindow();
 
-  // Poll server health every minute and reflect it in menus/tray.
+  // Poll server health, reflect it in menus/tray, and auto-recover the
+  // daemon (restart + reload the window) if it stops responding.
   updateServerHealth();
-  setInterval(updateServerHealth, 60000);
+  setInterval(updateServerHealth, HEALTH_CHECK_INTERVAL_MS);
+
+  // Check for app/CLI updates in the background (at most once every 24 h).
+  maybeAutoCheckUpdates();
+  setInterval(maybeAutoCheckUpdates, 6 * 60 * 60 * 1000);
 
   // Poll for pending approvals/questions more frequently (native notifications).
   pollPendingItems();
