@@ -27,7 +27,7 @@
   ipcRenderer.on('term-data', (_e, d) => { window.__termBuf += d; term.write(d); });
   ipcRenderer.on('term-exit', (_e, code) =>
     term.write(`\r\n\x1b[90m[process exited${code != null ? ' with code ' + code : ''}]\x1b[0m\r\n`));
-  ipcRenderer.on('term-error', (_e, msg) => term.write(`\r\n\x1b[31m[${msg}]\x1b[0m\r\n`));
+  ipcRenderer.on('term-error', (_e, msg) => { window.__termBuf += msg; term.write(`\r\n\x1b[31m[${msg}]\x1b[0m\r\n`); });
 
   ipcRenderer.send('term-ready', { cols: term.cols, rows: term.rows });
 </script>

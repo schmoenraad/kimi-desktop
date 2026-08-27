@@ -61,12 +61,16 @@ app opens straight into chat.
 - **Menu bar icon** — show window, open project, restart/stop the server, quit
 - **Check for Updates…** — compares the app against GitHub releases and the
   CLI against npm, and offers the download or the built-in CLI upgrade
-- **Native notifications** when a session needs approval or asks a question
+- **Native notifications** when a session needs approval or asks a question —
+  with native **Pending Approvals** / **Pending Questions** windows to answer
+  them without focusing the chat
 - **Launch at Login**, window state restored, external links open in your browser
 - Auto-starts the Kimi server on launch and injects its auth token, so reloads
   never hit the token wall
 
 ![Pending approvals](screenshots/approvals.png)
+
+![Pending questions](screenshots/questions.png)
 
 ### Projects
 - **⌘O** — open any folder as a Kimi workspace; **⌘⇧N** creates a new project folder
@@ -81,18 +85,21 @@ Skills are reusable instructions Kimi loads automatically when relevant — same
 ones from a template.
 
 ### Sessions & agents
-- **Nudge (⌘⇧M)** — queue a one-liner into a running session to steer the agent mid-work
+- **Nudge (⌘⇧M)** — queue a one-liner into a running session, or **Steer Now** to inject
+  it straight into the active turn (needs kimi-code ≥ 0.38)
 - **Abort (⌘.)**, Fork, Compact, Undo Last Turn, Archive/Restore, Export
 - **Background Tasks** — live list across sessions, with cancel buttons
 - **Terminal (⌘⇧T)** — a real PTY (xterm.js) attached to the session's workspace
 - **Browser pane (⌘⇧B)** — a companion browser docked beside the chat
+- **Plan Usage** — your real quota windows (5-hour and weekly) with reset times,
+  plus per-session token totals
 
 ![Terminal](screenshots/terminal.png)
 
 ### Workflows
 Save a recurring agent run — project + prompt + agent mode (Goal / Swarm / Plan) +
-permission mode + an optional daily time. One click from the Workflows menu; daily runs
-fire while the app is open.
+permission mode + model + an optional daily time. One click from the Workflows menu;
+daily runs fire while the app is open. Pin a cheaper model to scheduled runs.
 
 ![New workflow](screenshots/workflow-new.png)
 

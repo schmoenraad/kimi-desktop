@@ -820,9 +820,45 @@ function notifyOverload(reason) {
   }
 }
 
+/** "2026-08-26T19:49:49Z" -> "19:49 (in 2h 14m)". */
+function formatReset(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const ms = d.getTime() - Date.now();
+  if (ms <= 0) return `${d.toLocaleString()} (due now)`;
+  const mins = Math.round(ms / 60000);
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  const rel = h > 0 ? `in ${h}h ${m}m` : `in ${m}m`;
+  return `${d.toLocaleString()} (${rel})`;
+}
+
+/** One usage window line, e.g. "5-hour: 33/100 used (33%) — resets …". */
+function usageWindowLine(w) {
+  const label = `${w.window.duration}-${w.window.unit}`;
+  const pct = w.limit ? Math.round((w.used / w.limit) * 100) : 0;
+  return `${label} window: ${w.used}/${w.limit} used (${pct}%) — resets ${formatReset(w.reset_at)}`;
+}
+
 async function showUsageDialog() {
   try {
     await ensureKimiServer();
+    // Real managed-account quota (5-hour + weekly windows, with reset times).
+    let quotaDetail = '';
+    try {
+      const usage = await apiRequest('GET', '/api/v1/oauth/usage');
+      if (usage && usage.kind === 'ok' && usage.summary) {
+        const lines = [];
+        // The 5-hour rolling limit is the one that bites day to day — show it first.
+        const windows = [...(Array.isArray(usage.limits) ? usage.limits : []), usage.summary];
+        for (const w of windows) if (w && w.window) lines.push(usageWindowLine(w));
+        quotaDetail = lines.join('\n');
+      } else if (usage && usage.kind === 'error') {
+        quotaDetail = `Managed usage unavailable: ${usage.message || 'unknown error'}`;
+      }
+    } catch {
+      // Older server without /oauth/usage — fall through to session sums only.
+    }
     const data = await apiRequest('GET', '/api/v1/sessions');
     const sessions = sessionItems(data);
     const tokens = sessions.reduce(
@@ -835,12 +871,13 @@ async function showUsageDialog() {
       type: 'info',
       message: 'Plan usage',
       detail:
+        (quotaDetail ? `${quotaDetail}\n\n` : '') +
         `Active sessions: ${active}\n` +
         `Total reported tokens: ${tokens.toLocaleString()}\n` +
         `Total reported cost: $${cost.toFixed(4)}\n\n` +
-        'The 5-hour Allegretto budget is shown on the Kimi dashboard:\n' +
-        'https://platform.kimi.com\n\n' +
-        '(Session usage fields are zero until the server finishes reporting them.)',
+        'Full breakdown on the Kimi dashboard:\n' +
+        'https://platform.kimi.com' +
+        (quotaDetail ? '' : '\n\n(Quota windows need a kimi-code server with /oauth/usage.)'),
       buttons: ['Open Dashboard', 'OK'],
     }).then(({ response }) => {
       if (response === 0) shell.openExternal('https://platform.kimi.com');
@@ -1268,20 +1305,25 @@ function showNudgeWindow(session) {
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 16px; display: flex; flex-direction: column; gap: 12px; }
     input { flex: 1; font-size: 14px; padding: 8px; border-radius: 6px; border: 1px solid #ccc; }
-    button { align-self: flex-end; padding: 8px 16px; }
+    #btns { display: flex; justify-content: flex-end; gap: 8px; }
+    button { padding: 8px 16px; }
     #hint { font-size: 12px; color: #666; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   </style>
 </head>
 <body>
   <input id="prompt" type="text" placeholder="Tell the agent something…" autofocus>
-  <div id="hint">To: ${escHtml(title)} — queued behind anything running.</div>
-  <button id="send">Send</button>
+  <div id="hint">To: ${escHtml(title)} — Queue runs after the current turn; Steer injects into the running turn.</div>
+  <div id="btns">
+    <button id="steer">Steer Now</button>
+    <button id="send">Queue</button>
+  </div>
   <script>
     const { ipcRenderer } = require('electron');
     const input = document.getElementById('prompt');
-    const send = () => { const v = input.value.trim(); if (v) { ipcRenderer.send('nudge-submit', v); window.close(); } };
-    document.getElementById('send').onclick = send;
-    input.onkeydown = (e) => { if (e.key === 'Enter') send(); };
+    const send = (steer) => { const v = input.value.trim(); if (v) { ipcRenderer.send('nudge-submit', { text: v, steer }); window.close(); } };
+    document.getElementById('send').onclick = () => send(false);
+    document.getElementById('steer').onclick = () => send(true);
+    input.onkeydown = (e) => { if (e.key === 'Enter') send(e.shiftKey); };
     input.focus();
   </script>
 </body>
@@ -1292,7 +1334,7 @@ async function nudgeSessionDialog() {
   try {
     const session = await pickSession({
       message: 'Nudge a session',
-      detail: 'Sends a short message into that session — queued behind any running prompt, so it steers the agent mid-work.',
+      detail: 'Sends a short message into that session. Queue waits behind the running prompt; Steer injects it into the active turn immediately.',
     });
     if (session) showNudgeWindow(session);
   } catch (err) {
@@ -1722,22 +1764,40 @@ async function pollPendingItems() {
       buildMenu(); // refresh the Pending Approvals count in the Session menu
     }
 
-    // Sessions waiting on an AskUserQuestion answer: notify, click jumps into the chat.
+    // Sessions waiting on AskUserQuestion answers: fetch the question items,
+    // notify once per pending item, click opens the native answer window.
     const questionSessions = sessionItems(await apiRequest('GET', '/api/v1/sessions?status=awaiting_question'));
-    const questionKeys = new Set(questionSessions.map((s) => s.id));
+    const qFound = [];
+    for (const s of questionSessions.slice(0, 6)) {
+      try {
+        const data = await apiRequest('GET', `/api/v1/sessions/${encodeURIComponent(s.id)}/questions?status=pending`);
+        const list = Array.isArray(data) ? data : (data && (data.items || data.questions)) || [];
+        for (const item of list) qFound.push({ session: s, item });
+      } catch {
+        // session vanished between calls — skip
+      }
+    }
+    pendingQuestions = qFound;
+    const questionKeys = new Set(qFound.map((q) => `${q.session.id}:${q.item.id || q.item.question_id}`));
     if (Notification.isSupported()) {
-      for (const s of questionSessions) {
-        if (notifiedQuestionKeys.has(s.id)) continue;
-        notifiedQuestionKeys.add(s.id);
+      for (const q of qFound) {
+        const key = `${q.session.id}:${q.item.id || q.item.question_id}`;
+        if (notifiedQuestionKeys.has(key)) continue;
+        notifiedQuestionKeys.add(key);
+        const first = questionItemsOf(q.item)[0];
         const n = new Notification({
           title: 'Kimi has a question',
-          body: (s.title || s.id || 'A session needs an answer').slice(0, 180),
+          body: (first ? first.text : (q.session.title || q.session.id || '')).slice(0, 180),
         });
-        n.on('click', () => resumeSession(s));
+        n.on('click', () => showQuestionsWindow());
         n.show();
       }
     }
     notifiedQuestionKeys = new Set([...notifiedQuestionKeys].filter((k) => questionKeys.has(k)));
+    if (qFound.length !== lastPendingQuestionCount) {
+      lastPendingQuestionCount = qFound.length;
+      buildMenu(); // refresh the Pending Questions count in the Session menu
+    }
   } catch {
     // server hiccup — next tick retries
   }
@@ -1821,6 +1881,146 @@ async function showApprovalsWindow() {
   };
   approvalsRender = render;
   win.on('closed', () => { approvalsRender = null; approvalsWin = null; });
+  await render();
+}
+
+// --- Pending questions (AskUserQuestion) window ---
+
+let pendingQuestions = []; // [{ session, item }]
+let lastPendingQuestionCount = 0;
+let questionsWin = null;
+let questionsRender = null;
+
+/** Normalize one AskUserQuestion call into a list of {text, header, options, multi}. */
+function questionItemsOf(item) {
+  const qs = Array.isArray(item.questions) ? item.questions : [item];
+  return qs.map((q) => ({
+    text: q.question || q.text || q.title || 'Question',
+    header: q.header || '',
+    options: (Array.isArray(q.options) ? q.options : []).map((o) => ({
+      label: o.label || String(o),
+      description: o.description || '',
+    })),
+    multi: !!(q.multi_select || q.multiSelect),
+  }));
+}
+
+function questionsHtml(rows) {
+  const esc = escHtml;
+  const body = rows.length === 0
+    ? '<div class="empty">No pending questions.</div>'
+    : rows
+        .map(({ session, item }, cardIdx) => {
+          const itemId = item.id || item.question_id || '';
+          const qs = questionItemsOf(item)
+            .map((q, qi) => {
+              const opts = q.options
+                .map(
+                  (o) => `<label class="opt">
+  <input type="${q.multi ? 'checkbox' : 'radio'}" name="c${cardIdx}q${qi}" value="${esc(o.label)}">
+  <span><b>${esc(o.label)}</b>${o.description ? ` — <span class="od">${esc(o.description)}</span>` : ''}</span>
+</label>`
+                )
+                .join('\n');
+              return `<div class="q" data-qtext="${esc(q.text)}" data-multi="${q.multi ? 1 : 0}">
+  <div class="qhead">${q.header ? `<span class="chip">${esc(q.header)}</span>` : ''}${esc(q.text)}</div>
+  ${opts}
+  <input class="other" type="text" placeholder="Other (custom answer)…">
+</div>`;
+            })
+            .join('\n');
+          return `<div class="card" data-s="${esc(session.id)}" data-q="${esc(itemId)}">
+  <div class="sub">${esc((session.title || session.id || '').slice(0, 80))}</div>
+  ${qs}
+  <div class="btns">
+    <button class="submit">Submit Answers</button>
+    <button class="dismiss">Dismiss</button>
+    <button class="chat" data-sid="${esc(session.id)}">Chat</button>
+  </div>
+  <div class="err"></div>
+</div>`;
+        })
+        .join('\n');
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+    .sub { font-size: 11px; color: #888; margin-bottom: 8px; }
+    .q { margin-bottom: 12px; }
+    .qhead { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+    .chip { background: #eee; border-radius: 4px; padding: 1px 6px; font-size: 10px; font-weight: 500; margin-right: 6px; text-transform: uppercase; }
+    .opt { display: flex; gap: 8px; align-items: baseline; font-size: 13px; margin: 4px 0; cursor: pointer; }
+    .od { color: #777; font-size: 12px; }
+    .other { width: 100%; box-sizing: border-box; font-size: 12px; padding: 6px; margin-top: 4px; border-radius: 5px; border: 1px solid #ccc; }
+    .btns { display: flex; gap: 8px; margin-top: 6px; }
+    button { padding: 5px 14px; }
+    .submit { font-weight: 600; }
+    .empty { color: #888; margin-top: 24px; text-align: center; }
+    .err { color: #c00; font-size: 12px; min-height: 14px; margin-top: 4px; }
+    .missing .qhead { color: #c00; }
+    #refresh { float: right; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <button id="refresh">Refresh</button>
+  <div style="clear:both"></div>
+  ${body}
+  <script>
+    const { ipcRenderer } = require('electron');
+    document.getElementById('refresh').onclick = () => ipcRenderer.send('questions-refresh');
+    document.querySelectorAll('.card').forEach((card) => {
+      card.querySelector('.submit').onclick = () => {
+        const answers = {};
+        let ok = true;
+        card.querySelectorAll('.q').forEach((q) => {
+          q.classList.remove('missing');
+          const multi = q.dataset.multi === '1';
+          const picked = [...q.querySelectorAll('input:checked')].map((i) => i.value);
+          const other = q.querySelector('.other').value.trim();
+          if (other) picked.push(other);
+          if (!picked.length) { ok = false; q.classList.add('missing'); return; }
+          answers[q.dataset.qtext] = multi ? picked.join(', ') : picked[picked.length - 1];
+        });
+        if (!ok) { card.querySelector('.err').textContent = 'Answer every question (pick an option or type Other).'; return; }
+        card.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        ipcRenderer.send('question-answer', { sessionId: card.dataset.s, itemId: card.dataset.q, answers });
+      };
+      card.querySelector('.dismiss').onclick = () => {
+        card.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+        ipcRenderer.send('question-dismiss', { sessionId: card.dataset.s, itemId: card.dataset.q });
+      };
+    });
+    document.querySelectorAll('button.chat').forEach((b) => {
+      b.onclick = () => ipcRenderer.send('question-open-chat', b.dataset.sid);
+    });
+  </script>
+</body>
+</html>`;
+}
+
+async function showQuestionsWindow() {
+  if (questionsWin && !questionsWin.isDestroyed()) {
+    questionsWin.focus();
+    if (questionsRender) questionsRender();
+    return;
+  }
+  const win = new BrowserWindow({
+    width: 640,
+    height: 560,
+    title: 'Pending Questions',
+    webPreferences: { contextIsolation: false, nodeIntegration: true },
+  });
+  questionsWin = win;
+  const render = async () => {
+    await pollPendingItems();
+    if (win.isDestroyed()) return;
+    win.loadURL(`data:text/html;base64,${Buffer.from(questionsHtml(pendingQuestions)).toString('base64')}`);
+  };
+  questionsRender = render;
+  win.on('closed', () => { questionsRender = null; questionsWin = null; });
   await render();
 }
 
@@ -1926,11 +2126,16 @@ let terminalWs = null;
 let terminalSession = null;
 let terminalId = null;
 let wsMsgSeq = 0;
+let terminalAttachId = null; // id of the in-flight terminal_attach message
+let terminalAttachLive = false; // attach acked or first output seen
 
 function wsSend(type, payload) {
   if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
-    terminalWs.send(JSON.stringify({ type, id: `d${++wsMsgSeq}`, payload }));
+    const id = `d${++wsMsgSeq}`;
+    terminalWs.send(JSON.stringify({ type, id, payload }));
+    return id;
   }
+  return null;
 }
 
 function closeTerminalPty() {
@@ -1944,6 +2149,8 @@ function closeTerminalPty() {
   terminalWs = null;
   terminalId = null;
   terminalSession = null;
+  terminalAttachId = null;
+  terminalAttachLive = false;
 }
 
 async function openTerminalWindow() {
@@ -1989,13 +2196,48 @@ async function startTerminal(cols, rows) {
     });
     terminalWs.on('open', () => {
       wsSend('client_hello', { client_id: 'kimi-desktop-terminal', subscriptions: [] });
-      wsSend('terminal_attach', { session_id: terminalSession.id, terminal_id: terminalId });
+      terminalAttachLive = false;
+      terminalAttachId = wsSend('terminal_attach', { session_id: terminalSession.id, terminal_id: terminalId });
+      // kimi-code ≥ 0.32 declares terminal_attach in its protocol but never routes
+      // it (WsConnectionV1.onMessage only dispatches subscription-family messages),
+      // so the attach is silently dropped — no ack, no output. Detect the silence
+      // and say so instead of showing a dead terminal.
+      const ws = terminalWs;
+      const sid = terminalSession.id;
+      const tid = terminalId;
+      setTimeout(async () => {
+        if (terminalAttachLive || ws !== terminalWs) return;
+        let version = '';
+        try {
+          const meta = await apiRequest('GET', '/api/v1/meta');
+          if (meta && meta.server_version) version = meta.server_version;
+        } catch {
+          // meta unavailable — report without a version
+        }
+        signalError(
+          `No response to terminal_attach${version ? ` from server ${version}` : ''} — this kimi-code ` +
+            'server ignores WS terminal control (broken since at least 0.32; the web UI terminal is ' +
+            'affected too). The terminal needs a server version with the control handlers wired.'
+        );
+        // Attach is dead — close the orphaned PTY via REST so it does not linger.
+        try {
+          await apiRequest(
+            'POST',
+            `/api/v1/sessions/${encodeURIComponent(sid)}/terminals/${encodeURIComponent(tid)}:close`
+          );
+        } catch {
+          // best effort
+        }
+      }, 5000);
     });
     terminalWs.on('message', (raw) => {
       if (!terminalWin || terminalWin.isDestroyed()) return;
       try {
         const m = JSON.parse(raw.toString());
-        if (m.type === 'terminal_output' && m.terminal_id === terminalId) {
+        if (m.type === 'ack' && m.id && m.id === terminalAttachId) {
+          terminalAttachLive = true;
+        } else if (m.type === 'terminal_output' && m.terminal_id === terminalId) {
+          terminalAttachLive = true;
           terminalWin.webContents.send('term-data', m.payload.data);
         } else if (m.type === 'terminal_exit' && m.terminal_id === terminalId) {
           terminalWin.webContents.send('term-exit', m.payload && m.payload.exit_code);
@@ -2133,6 +2375,7 @@ async function runWorkflow(wf) {
     if (wf.mode === 'swarm') body.swarm_mode = true;
     if (wf.mode === 'plan') body.plan_mode = true;
     if (wf.permission && wf.permission !== 'default') body.permission_mode = wf.permission;
+    if (wf.model && wf.model !== 'default') body.model = wf.model;
     await apiRequest('POST', `/api/v1/sessions/${encodeURIComponent(session.id)}/prompts`, body);
     wf.lastRunAt = new Date().toISOString();
     savePrefs(prefs);
@@ -2194,9 +2437,10 @@ function newWorkflowDialog() {
     return;
   }
   const projectsJson = JSON.stringify(projects.map((p) => ({ path: p, label: p.replace(os.homedir(), '~') }))).replace(/</g, '\\u003c');
+  const modelsJson = JSON.stringify(loadModels().map((m) => ({ alias: m.alias, label: m.displayName }))).replace(/</g, '\\u003c');
   const win = new BrowserWindow({
     width: 520,
-    height: 560,
+    height: 610,
     resizable: false,
     title: 'New Workflow',
     webPreferences: { contextIsolation: false, nodeIntegration: true },
@@ -2238,6 +2482,8 @@ function newWorkflowDialog() {
     <option value="auto">Auto</option>
     <option value="yolo">YOLO</option>
   </select>
+  <label>Model</label>
+  <select id="model"></select>
   <label>Schedule</label>
   <div id="sched">
     <select id="schedule">
@@ -2255,12 +2501,23 @@ function newWorkflowDialog() {
   <script>
     const { ipcRenderer } = require('electron');
     const projects = ${projectsJson};
+    const models = ${modelsJson};
     const $ = (id) => document.getElementById(id);
     for (const p of projects) {
       const opt = document.createElement('option');
       opt.value = p.path;
       opt.textContent = p.label;
       $('cwd').appendChild(opt);
+    }
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = 'default';
+    defaultOpt.textContent = 'Server default';
+    $('model').appendChild(defaultOpt);
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m.alias;
+      opt.textContent = m.label;
+      $('model').appendChild(opt);
     }
     $('schedule').onchange = () => { $('time').style.display = $('schedule').value === 'daily' ? '' : 'none'; };
     $('cancel').onclick = () => window.close();
@@ -2271,6 +2528,7 @@ function newWorkflowDialog() {
         prompt: $('prompt').value.trim(),
         mode: $('mode').value,
         permission: $('permission').value,
+        model: $('model').value,
         schedule: $('schedule').value === 'daily' ? { type: 'daily', time: $('time').value } : { type: 'manual' },
       };
       if (!wf.name || !wf.prompt) { $('error').textContent = 'Name and prompt are required.'; return; }
@@ -2294,7 +2552,9 @@ function workflowsSubmenu() {
           submenu: [
             { label: 'Run Now', click: () => runWorkflow(wf) },
             {
-              label: `${wf.mode}${wf.schedule && wf.schedule.type === 'daily' ? ` · daily ${wf.schedule.time}` : ' · manual'}`,
+              label:
+                `${wf.mode}${wf.schedule && wf.schedule.type === 'daily' ? ` · daily ${wf.schedule.time}` : ' · manual'}` +
+                `${wf.model && wf.model !== 'default' ? ` · ${wf.model}` : ''}`,
               enabled: false,
             },
             ...(wf.lastRunAt ? [{ label: `Last run: ${new Date(wf.lastRunAt).toLocaleString()}`, enabled: false }] : []),
@@ -3043,6 +3303,10 @@ function buildMenu() {
           label: pendingApprovals.length ? `Pending Approvals… (${pendingApprovals.length})` : 'Pending Approvals…',
           click: showApprovalsWindow,
         },
+        {
+          label: pendingQuestions.length ? `Pending Questions… (${pendingQuestions.length})` : 'Pending Questions…',
+          click: showQuestionsWindow,
+        },
         { type: 'separator' },
         {
           label: 'Fork Session…',
@@ -3343,15 +3607,34 @@ ipcMain.on('add-provider-submit', (event, payload) => {
   });
 });
 
-// Nudge window -> queue a prompt into the chosen session.
-ipcMain.on('nudge-submit', (_event, text) => {
+// Nudge window -> queue a prompt into the chosen session, optionally steering it
+// straight into the active turn (POST /prompts::steer pulls a queued prompt in).
+ipcMain.on('nudge-submit', (_event, payload) => {
+  const text = typeof payload === 'string' ? payload : payload && payload.text;
+  const steer = !!(payload && payload.steer);
   if (!nudgeTarget || typeof text !== 'string' || !text.trim()) return;
   const target = nudgeTarget;
   nudgeTarget = null;
-  apiRequest('POST', `/api/v1/sessions/${encodeURIComponent(target.id)}/prompts`, {
-    content: [{ type: 'text', text: text.trim() }],
-  })
-    .then(() => notifyOK('Nudge sent', target.title || target.id))
+  const base = `/api/v1/sessions/${encodeURIComponent(target.id)}/prompts`;
+  apiRequest('POST', base, { content: [{ type: 'text', text: text.trim() }] })
+    .then(async (res) => {
+      if (steer) {
+        const pid = res && (res.prompt_id || res.id);
+        if (pid) {
+          try {
+            await apiRequest('POST', `${base}::steer`, { prompt_ids: [pid] });
+          } catch (steerErr) {
+            if (/unsupported action/i.test(String(steerErr && steerErr.message))) {
+              notifyOK('Nudge queued', 'Steer needs kimi-code ≥ 0.38 — restart the server to pick it up');
+              return;
+            }
+            // Otherwise nothing to steer (no active turn, or the prompt already
+            // started) — the nudge is queued either way.
+          }
+        }
+      }
+      notifyOK(steer ? 'Steer sent' : 'Nudge sent', target.title || target.id);
+    })
     .catch((err) => dialog.showErrorBox('Could not nudge session', err.message));
 });
 
@@ -3392,6 +3675,44 @@ ipcMain.on('approvals-refresh', () => {
 
 ipcMain.on('approval-open-chat', (_event, sessionId) => {
   const found = pendingApprovals.find((p) => p.session.id === sessionId);
+  if (found) resumeSession(found.session);
+});
+
+// Questions window.
+ipcMain.on('question-answer', async (_event, payload) => {
+  try {
+    await apiRequest(
+      'POST',
+      `/api/v1/sessions/${encodeURIComponent(payload.sessionId)}/questions/${encodeURIComponent(payload.itemId)}`,
+      { answers: payload.answers }
+    );
+  } catch (err) {
+    dialog.showErrorBox('Could not submit answers', err.message);
+  }
+  if (questionsRender) questionsRender();
+});
+
+ipcMain.on('question-dismiss', async (_event, payload) => {
+  const base = `/api/v1/sessions/${encodeURIComponent(payload.sessionId)}/questions/${encodeURIComponent(payload.itemId)}`;
+  try {
+    await apiRequest('POST', `${base}:dismiss`, {});
+  } catch {
+    // Fallback for servers without the :dismiss verb: resolve with empty answers.
+    try {
+      await apiRequest('POST', base, { answers: {}, note: 'Dismissed from Kimi Code Desktop' });
+    } catch (err) {
+      dialog.showErrorBox('Could not dismiss question', err.message);
+    }
+  }
+  if (questionsRender) questionsRender();
+});
+
+ipcMain.on('questions-refresh', () => {
+  if (questionsRender) questionsRender();
+});
+
+ipcMain.on('question-open-chat', (_event, sessionId) => {
+  const found = pendingQuestions.find((q) => q.session.id === sessionId);
   if (found) resumeSession(found.session);
 });
 
