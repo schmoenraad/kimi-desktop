@@ -1,7 +1,7 @@
 {
   "name": "kimi-code-desktop",
   "productName": "Kimi Code",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Desktop app for Kimi Code — wraps the local Kimi web UI in a native Mac window",
   "main": "main.js",
   "scripts": {

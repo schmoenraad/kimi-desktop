@@ -24,6 +24,10 @@ const SKILLS_DIR = path.join(os.homedir(), '.kimi-code', 'skills');
 // pid/port). Used to find the process to stop and the port it drifted to.
 const SERVER_INSTANCES_DIR = path.join(os.homedir(), '.kimi-code', 'server', 'instances');
 const SERVER_PID_FILE = () => path.join(app.getPath('userData'), 'server-pid.json');
+// stdout/stderr of the last server launch — the reason a failed start is no
+// longer invisible (stdio used to be 'ignore', leaving the "did not respond"
+// dialog with zero diagnostics).
+const SERVER_LOG_FILE = () => path.join(app.getPath('userData'), 'server-launch.log');
 const PREFS_FILE = () => path.join(app.getPath('userData'), 'prefs.json');
 const WINDOW_STATE_FILE = () => path.join(app.getPath('userData'), 'window-state.json');
 const QUICK_TOGGLE_ACCELERATOR = 'Alt+Space';
@@ -378,15 +382,56 @@ function isServerUp() {
   });
 }
 
+// Set when the spawned server exits before answering on its port, so
+// ensureKimiServer can fail fast instead of polling the full timeout.
+let spawnedServerExit = null;
+
+/**
+ * npm strips the executable bit from node-pty's spawn-helper on every
+ * upgrade, breaking PTY creation with `posix_spawnp failed` (see HANDOVER.md).
+ * Restore it before spawning the server — cheap no-op when already correct.
+ */
+function fixNodePtyPermissions(kimiBin) {
+  try {
+    const realBin = fs.realpathSync(kimiBin);
+    // bin/kimi -> ../lib/node_modules/@moonshot-ai/kimi-code/...
+    const pkgDir = path.dirname(path.dirname(realBin));
+    const helper = path.join(pkgDir, 'node_modules', 'node-pty', 'prebuilds', 'darwin-arm64', 'spawn-helper');
+    if (!fs.existsSync(helper)) return;
+    if (!(fs.statSync(helper).mode & 0o111)) fs.chmodSync(helper, 0o755);
+  } catch {
+    // best effort — PTY creation will surface its own error if still broken
+  }
+}
+
 function startKimiServer(kimiBin) {
   return new Promise((resolve, reject) => {
+    fixNodePtyPermissions(kimiBin);
+    let logFd;
+    try {
+      logFd = fs.openSync(SERVER_LOG_FILE(), 'a');
+      fs.writeSync(logFd, `\n--- launch ${new Date().toISOString()} (${kimiBin} web --port ${kimiPort}) ---\n`);
+    } catch {
+      logFd = 'ignore';
+    }
+    spawnedServerExit = null;
     const child = spawn(kimiBin, ['web', '--no-open', '--port', String(kimiPort)], {
       detached: true,
-      stdio: 'ignore',
-      env: { ...process.env, PATH: `${path.dirname(kimiBin)}:${process.env.PATH || '/usr/bin:/bin'}` },
+      stdio: logFd === 'ignore' ? 'ignore' : ['ignore', logFd, logFd],
+      // Finder launches do not inherit the shell PATH; include Node install locations.
+      env: { ...process.env, PATH: [
+        path.dirname(kimiBin), path.join(os.homedir(), '.local', 'bin'),
+        '/opt/homebrew/bin', '/usr/local/bin', process.env.PATH || '/usr/bin:/bin',
+      ].join(':') },
     });
     child.on('error', reject);
+    child.on('exit', (code, signal) => {
+      spawnedServerExit = { code, signal };
+    });
     child.unref();
+    if (logFd !== 'ignore') {
+      try { fs.closeSync(logFd); } catch { /* best effort */ }
+    }
     if (child.pid) {
       spawnedServerPid = child.pid;
       try {
@@ -403,9 +448,21 @@ async function waitForServer(timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await isServerUp()) return true;
+    // The spawned server already died — no point polling until the deadline.
+    if (spawnedServerExit) return false;
     await new Promise((r) => setTimeout(r, 400));
   }
   return false;
+}
+
+/** Last lines of the server launch log, for the startup-failure dialog. */
+function readServerLogTail(maxChars = 1500) {
+  try {
+    const content = fs.readFileSync(SERVER_LOG_FILE(), 'utf8').trim();
+    return content.length > maxChars ? `…${content.slice(-maxChars)}` : content;
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -455,10 +512,23 @@ async function ensureKimiServer({ silent = false } = {}) {
     up = await waitForServer(5000);
   }
   if (!up && !silent) {
-    dialog.showErrorBox(
-      'Kimi server did not start',
-      `The Kimi server did not respond on port ${kimiPort}.\nTry running "kimi doctor" in a terminal, then relaunch.`
-    );
+    const exit = spawnedServerExit;
+    const tail = readServerLogTail();
+    let detail = `The Kimi server did not respond on port ${kimiPort}.`;
+    if (exit) detail += `\nThe server process exited immediately (code ${exit.code ?? '–'}, signal ${exit.signal ?? '–'}).`;
+    detail += tail
+      ? `\n\nLast server output:\n${tail}`
+      : '\nTry running "kimi doctor" in a terminal, then relaunch.';
+    const { response } = await dialog.showMessageBox({
+      type: 'error',
+      message: 'Kimi server did not start',
+      detail,
+      buttons: ['Retry', 'Run Diagnostics', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+    });
+    if (response === 0) return ensureKimiServer();
+    if (response === 1) runDiagnostics();
   }
   return up;
 }
@@ -847,11 +917,23 @@ async function showUsageDialog() {
     let quotaDetail = '';
     try {
       const usage = await apiRequest('GET', '/api/v1/oauth/usage');
-      if (usage && usage.kind === 'ok' && usage.summary) {
+      if (usage && usage.kind === 'ok') {
         const lines = [];
-        // The 5-hour rolling limit is the one that bites day to day — show it first.
-        const windows = [...(Array.isArray(usage.limits) ? usage.limits : []), usage.summary];
-        for (const w of windows) if (w && w.window) lines.push(usageWindowLine(w));
+        if (usage.quota && usage.quota.usages) {
+          // kimi-code 2.x shape: { quota: { usages: { limit5h: {usedRatio, resetAt}, limit7d: {...} } } }
+          const LABELS = { limit5h: '5-hour', limit7d: 'weekly' };
+          for (const key of Object.keys(LABELS)) {
+            const w = usage.quota.usages[key];
+            if (w && typeof w.usedRatio === 'number') {
+              lines.push(`${LABELS[key]} window: ${Math.round(w.usedRatio * 100)}% used — resets ${formatReset(w.resetAt)}`);
+            }
+          }
+        } else if (usage.summary) {
+          // pre-2.0 shape: { limits: [...], summary: {...} }
+          // The 5-hour rolling limit is the one that bites day to day — show it first.
+          const windows = [...(Array.isArray(usage.limits) ? usage.limits : []), usage.summary];
+          for (const w of windows) if (w && w.window) lines.push(usageWindowLine(w));
+        }
         quotaDetail = lines.join('\n');
       } else if (usage && usage.kind === 'error') {
         quotaDetail = `Managed usage unavailable: ${usage.message || 'unknown error'}`;
