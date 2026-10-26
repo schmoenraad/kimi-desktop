@@ -77,14 +77,20 @@ function seedStorage(webContents) {
   webContents.executeJavaScript(js).catch(() => {});
 }
 
-/** Dismiss the first-run preferences modal if it shows. */
+/** Dismiss the first-run preferences modal / welcome screen if it shows. */
 async function dismissOnboarding(win) {
   await win.webContents
     .executeJavaScript(`(async () => {
       for (let i = 0; i < 20; i++) {
         const dlg = [...document.querySelectorAll('.ui-dialog')].find((e) => e.offsetParent);
-        if (!dlg) return;
-        [...dlg.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Get started')?.click();
+        if (dlg) {
+          [...dlg.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Get started')?.click();
+        } else {
+          // Full-page welcome screen: Skip leaves everything at defaults.
+          const skip = [...document.querySelectorAll('button, a')].find((b) => b.offsetParent && b.textContent.trim() === 'Skip');
+          if (!skip) return;
+          skip.click();
+        }
         await new Promise((r) => setTimeout(r, 500));
       }
     })()`)
@@ -106,24 +112,117 @@ function hideNonDemoGroups(win) {
     .catch(() => 0);
 }
 
+/**
+ * Mask the signed-in account in the sidebar footer: replace the name with a
+ * demo name and hide the avatar photo. Both are personal data and must never
+ * land in a published shot — assertNoRealData backstops the name part by hard
+ * failing on the local username.
+ */
+function maskAccountName(win) {
+  const username = os.userInfo().username;
+  return win.webContents
+    .executeJavaScript(`(() => {
+      const needle = ${JSON.stringify(username)}.toLowerCase();
+      if (!needle) return 0;
+      // Tightest element containing the username = the name label.
+      let target = null;
+      document.querySelectorAll('body *').forEach((el) => {
+        const t = el.textContent || '';
+        if (t.toLowerCase().includes(needle) && (!target || t.length < target.textContent.length)) target = el;
+      });
+      if (!target) return 0;
+      target.textContent = 'Demo User';
+      // Hide avatar images in the surrounding footer block.
+      let footer = target;
+      for (let i = 0; i < 4 && footer.parentElement; i++) footer = footer.parentElement;
+      footer.querySelectorAll('img').forEach((img) => { img.style.visibility = 'hidden'; });
+      return 1;
+    })()`)
+    .catch(() => 0);
+}
+
+/**
+ * Remove stale demo sessions from previous seeding runs. Demo rows are seeded
+ * minutes before capture, so any row dated in months/years is a leftover whose
+ * workspace no longer exists (clicking it shows a load-error toast).
+ */
+function pruneStaleDemoRows(win) {
+  return win.webContents
+    .executeJavaScript(`(() => {
+      const keep = ${JSON.stringify(DEMO_WORKSPACES)};
+      let removed = 0;
+      for (const name of keep) {
+        const groups = [...document.querySelectorAll('.side .group')].filter(
+          (g) => ((g.querySelector('.gh-name') || {}).textContent || '').trim() === name
+        );
+        for (const g of groups) {
+          for (const el of [...g.querySelectorAll('*')]) {
+            // Relative-date badge like "1mo" / "2y" — leaf element, short text.
+            if (el.children.length === 0 && /^\\d+\\s*(mo|y)$/.test((el.textContent || '').trim())) {
+              let row = el;
+              for (let i = 0; i < 4 && row.parentElement && row.parentElement !== g; i++) row = row.parentElement;
+              row.remove();
+              removed++;
+            }
+          }
+        }
+      }
+      return removed;
+    })()`)
+    .catch(() => 0);
+}
+
+/** With several demo runs on one machine, keep only groups that have sessions. */
+function dedupeDemoGroups(win) {
+  return win.webContents
+    .executeJavaScript(`(() => {
+      const keep = ${JSON.stringify(DEMO_WORKSPACES)};
+      let removed = 0;
+      for (const name of keep) {
+        const groups = [...document.querySelectorAll('.side .group')].filter(
+          (g) => ((g.querySelector('.gh-name') || {}).textContent || '').trim() === name
+        );
+        if (groups.length <= 1) continue;
+        const empty = groups.filter(
+          (g) => g.textContent.includes('No conversations yet') || !g.querySelector('.t')
+        );
+        // Never remove every copy — keep at least one group per demo name.
+        for (const g of empty.slice(0, Math.max(0, groups.length - 1))) { g.remove(); removed++; }
+      }
+      return removed;
+    })()`)
+    .catch(() => 0);
+}
+
 /** Open the newest session inside the hero demo workspace. */
 async function openHeroSession(win) {
   const ok = await win.webContents
-    .executeJavaScript(`(() => {
-      const group = [...document.querySelectorAll('.side .group')].find(
-        (g) => ((g.querySelector('.gh-name') || {}).textContent || '').trim() === ${JSON.stringify(HERO_WORKSPACE)}
-      );
-      if (!group) return 'no-group';
-      const title = group.querySelector('.t');
-      if (!title) return 'no-session';
-      // Click the row itself, not the truncated title span.
-      let el = title;
-      for (let i = 0; i < 4 && el; i++) {
-        if (el.className && /row|item|sess/i.test(el.className)) break;
-        el = el.parentElement;
+    .executeJavaScript(`(async () => {
+      for (let tries = 0; tries < 16; tries++) {
+        const groups = [...document.querySelectorAll('.side .group')].filter(
+          (g) => ((g.querySelector('.gh-name') || {}).textContent || '').trim() === ${JSON.stringify(HERO_WORKSPACE)}
+        );
+        let clickedExpand = false;
+        for (const group of groups) {
+          const title = group.querySelector('.t');
+          if (title) {
+            // Click the row itself, not the truncated title span.
+            let el = title;
+            for (let i = 0; i < 4 && el; i++) {
+              if (el.className && /row|item|sess/i.test(el.className)) break;
+              el = el.parentElement;
+            }
+            (el || title).click();
+            return 'clicked';
+          }
+          // No session rows yet — the group may be collapsed; expand it.
+          (group.querySelector('.gh') || group).click();
+          clickedExpand = true;
+        }
+        if (!groups.length) return 'no-group';
+        await new Promise((r) => setTimeout(r, 500));
       }
-      (el || title).click();
-      return 'clicked';
+      return 'no-session';
     })()`)
     .catch((e) => 'err ' + e.message);
   return ok;
@@ -148,8 +247,12 @@ async function assertNoRealData(win) {
   const homeDir = os.homedir();
   const forbidden = [homeDir, os.userInfo().username, '/Users/'];
   for (const needle of forbidden) {
-    if (body.includes(needle) || crumb.includes(needle)) {
-      throw new Error(`LEAK: frame contains "${needle}"`);
+    for (const [label, text] of [['body', body], ['crumb', crumb]]) {
+      const i = text.indexOf(needle);
+      if (i >= 0) {
+        const ctx = text.slice(Math.max(0, i - 120), i + 120).replace(/\s+/g, ' ');
+        throw new Error(`LEAK: ${label} contains "${needle}" — context: …${ctx}…`);
+      }
     }
   }
   console.log(`  safety ok — workspaces visible: ${groups.join(', ') || '(none)'}`);
@@ -163,12 +266,23 @@ async function captureHero() {
   await sleep(8000);
   await dismissOnboarding(win);
   await sleep(800);
+  // Reload after onboarding so the SPA boots straight into the main UI with a
+  // clean state (and without the first-load error toasts).
+  await win.loadURL(KIMI_URL);
+  await sleep(8000);
+  await dismissOnboarding(win);
+  await sleep(800);
 
   console.log(`  hid ${await hideNonDemoGroups(win)} non-demo workspace groups`);
+  console.log(`  pruned ${await pruneStaleDemoRows(win)} stale demo rows`);
+  console.log(`  removed ${await dedupeDemoGroups(win)} empty demo groups`);
   console.log(`  open hero session: ${await openHeroSession(win)}`);
   await sleep(2500);
   // The sidebar re-renders after switching sessions — strip real groups again.
   await hideNonDemoGroups(win);
+  await pruneStaleDemoRows(win);
+  await dedupeDemoGroups(win);
+  console.log(`  masked ${await maskAccountName(win)} account name nodes`);
 
   // Draft text in the composer so the shot shows an active workflow.
   await win.webContents
