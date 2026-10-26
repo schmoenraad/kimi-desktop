@@ -166,7 +166,7 @@ hard fails if a real workspace or home path would appear in a published frame.
   Stop it with **Kimi Code → Stop Kimi Server**.
 - The app is unsigned, so **Check for Updates…** notifies and opens the
   download page rather than installing in place.
-- Built against Kimi Code **0.32.0**. It reads the server's REST API and
+- Built against Kimi Code **2.3.2**. It reads the server's REST API and
   `config.toml`, so a future Kimi release could move something underneath it.
 
 ## License
