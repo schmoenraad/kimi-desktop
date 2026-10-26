@@ -1671,7 +1671,7 @@ async function refreshAuthState() {
 async function reLoginDialog() {
   try {
     await ensureKimiServer();
-    const start = await apiRequest('POST', '/api/v1/oauth/login');
+    const start = await apiRequest('POST', '/api/v1/oauth/login', {});
     const url = start && (start.verification_uri || start.verification_url || start.url);
     const code = (start && (start.user_code || start.code)) || '';
     if (!url) throw new Error('Server did not return a verification URL.');
